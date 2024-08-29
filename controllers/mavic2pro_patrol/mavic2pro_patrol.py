@@ -1,12 +1,32 @@
 
 import torch
-import time
+from time import sleep
 import cv2
 import numpy as np
 from controller import Robot, Motor, Camera, Compass, GPS, Gyro, InertialUnit, Keyboard, LED
 import math
-import subprocess
-import os
+import threading
+
+
+length = 640
+width = 400
+thread_running = False
+
+robot = Robot()
+timestep = int(robot.getBasicTimeStep())
+camera = robot.getDevice("camera")
+camera.enable(timestep)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = torch.hub.load('ultralytics/yolov5', 'custom', path='best.pt')
+model.to(device)  
+model.eval()
+
+c_roll_disturbance = 0.0
+c_pitch_disturbance = 0.0
+c_camera_pitch_position = 0.0
+c_yaw_disturbance = 0
+c_target_altitude = 0
+
 
 def sign(x):
     return (x > 0) - (x < 0)
@@ -14,31 +34,92 @@ def sign(x):
 def clamp(value, low, high):
     return max(min(value, high), low)
 
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-    image_cnt = 0
+def image_processing():
+    first_step = True
+    while True:
 
-    robot = Robot()
-    timestep = int(robot.getBasicTimeStep())
+        # sleep(1)
+        # global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance
+        # c_camera_pitch_position += 0.5  
+        # print("camera_pitch_position change")
+   
 
-    # Get and enable devices.
-    camera = robot.getDevice("camera")
-    camera.enable(timestep)
-    front_left_led = robot.getDevice("front left led")
-    front_right_led = robot.getDevice("front right led")
+        sleep(1)
+        image = camera.getImageArray()
+        if image:
+            image_np = np.array(image, dtype=np.uint8)
+            img_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
+            img_rgb = cv2.resize(img_rgb, (length, width))
+            img_rgb = cv2.flip(img_rgb, 1) 
+            results = model(img_rgb)
+            
+   
+            highest_confidence_result = None
+            max_confidence = 0
+
+            for result in results.pandas().xyxy[0].to_dict(orient='records'):
+                confidence = result['confidence']
+                if confidence > max_confidence:
+                    max_confidence = confidence
+                    highest_confidence_result = result
+            
+            if highest_confidence_result:
+                bbox = highest_confidence_result['xmin'], highest_confidence_result['ymin'], highest_confidence_result['xmax'], highest_confidence_result['ymax']
+                label = highest_confidence_result['name']
+                confidence = highest_confidence_result['confidence']
+
+                center_x = int((bbox[0] + bbox[2]) / 2)
+                center_y = int((bbox[1] + bbox[3]) / 2)
+                cv2.circle(img_rgb, (center_x, center_y), radius=5, color=(0, 0, 255), thickness=-1)
+
+                cv2.putText(img_rgb, f'{label} {confidence:.2f}', (int(bbox[0]), int(bbox[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                
+
+                
+                global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude
+                
+
+
+                if first_step:
+                    c_yaw_disturbance = clamp(-(center_x - length/2) * 0.001, -0.1, 0.1)
+                    
+                    if center_y < 0.61 * width:  
+                        c_pitch_disturbance = -1
+                    else:   
+                        c_pitch_disturbance = 0.1
+
+                    if center_y > 0.6 * width and c_camera_pitch_position - 0.1 < 1.7:  
+                        c_camera_pitch_position += 0.1  
+                        print("camera_pitch_position change", c_camera_pitch_position) 
+
+                    if  c_pitch_disturbance == 0.1 and c_camera_pitch_position - 0.1 >= 1.7:
+                        first_step = False
+
+                else:
+                    c_target_altitude = - 0.7
+                    c_roll_disturbance = clamp(-(center_x - length/2) * 0.01, -1.0, 1.0)
+                    c_pitch_disturbance = clamp((center_y > width/2), -1, 2)
+                    
+            
+            cv2.imshow("Black and White Image", img_rgb)
+            cv2.waitKey(1)
+
+
+
+
+def main():  
+    global thread_running 
     imu = robot.getDevice("inertial unit")
     imu.enable(timestep)
 
-    compass = robot.getDevice("compass")
-    compass.enable(timestep)
     gyro = robot.getDevice("gyro")
     gyro.enable(timestep)
 
-    camera_roll_motor = robot.getDevice("camera roll")
     camera_pitch_motor = robot.getDevice("camera pitch")
-    camera_yaw_motor = robot.getDevice("camera yaw")  # Added for yaw control
 
     front_left_motor = robot.getDevice("front left propeller")
     front_right_motor = robot.getDevice("front right propeller")
@@ -50,8 +131,7 @@ def main():
         motor.setVelocity(1.0)
 
     print("Start the drone...")
-    gps = robot.getDevice("gps")
-    gps.enable(timestep)
+
     keyboard = Keyboard()
     keyboard.enable(timestep)
 
@@ -59,52 +139,35 @@ def main():
         if robot.getTime() > 1.0:
             break
 
-    print("You can control the drone with your computer keyboard:")
-    print("- 'up': move forward.")
-    print("- 'down': move backward.")
-    print("- 'right': turn right.")
-    print("- 'left': turn left.")
-    print("- 'shift + up': increase the target altitude.")
-    print("- 'shift + down': decrease the target altitude.")
-    print("- 'shift + right': strafe right.")
-    print("- 'shift + left': strafe left.")
-    print("- 'W': tilt camera up.")
-    print("- 'S': tilt camera down.")
-    print("- 'A': pan camera left.")
-    print("- 'D': pan camera right.")
+
 
     k_vertical_thrust = 68.5
-    k_vertical_offset = 0.6
     k_vertical_p = 3.0
     k_roll_p = 50.0
     k_pitch_p = 30.0
 
     target_altitude = 1.0
 
-    # Variables for camera control
     camera_pitch_position = 0.0
-    camera_yaw_position = 0.0
-    camera_rotation_speed = 0.05  # Adjust this value to change camera rotation speed
+    camera_rotation_speed = 0.05  
 
+    image_processing
+    thread = threading.Thread(target = image_processing)
+    
     # Main control loop
     while robot.step(timestep) != -1:
-        time = robot.getTime()
         roll = imu.getRollPitchYaw()[0]
         pitch = imu.getRollPitchYaw()[1]
-        altitude = gps.getValues()[2]
+        
         roll_acceleration = gyro.getValues()[0]
         pitch_acceleration = gyro.getValues()[1]
 
-        led_state = int(time) % 2
-        front_left_led.set(led_state)
-        front_right_led.set(1 - led_state)
-
-        camera_roll_motor.setPosition(-0.115 * roll_acceleration)
         camera_pitch_motor.setPosition(-0.1 * pitch_acceleration)
 
         roll_disturbance = 0.0
         pitch_disturbance = 0.0
         yaw_disturbance = 0.0
+        target_altitude = 0.59
         key = keyboard.getKey()
         
         if key == Keyboard.UP:
@@ -120,41 +183,34 @@ def main():
         elif key == (Keyboard.SHIFT + Keyboard.LEFT):
             roll_disturbance = 1.0
         elif key == (Keyboard.SHIFT + Keyboard.UP):
-            target_altitude += 0.05
-            print(f"target altitude: {target_altitude:.2f} [m]")
+            target_altitude += 0.5
         elif key == (Keyboard.SHIFT + Keyboard.DOWN):
-            target_altitude -= 0.05
-            print(f"target altitude: {target_altitude:.2f} [m]")
+            target_altitude -= 0.5
         elif key == ord('W'):  # Tilt camera up
             camera_pitch_position += camera_rotation_speed
         elif key == ord('S'):  # Tilt camera down
             camera_pitch_position -= camera_rotation_speed
-        elif key == ord('A'):  # Pan camera left
-            camera_yaw_position += camera_rotation_speed
-        elif key == ord('D'):  # Pan camera right
-            camera_yaw_position -= camera_rotation_speed
 
 
-        # elif key == ord('C'):  # capture
-        #     image = camera.getImageArray()
-        #     image_np = np.array(image, dtype=np.uint8)
-        #     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB) 
-        #     image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
-        #     path = 'E://UNI//8//project//images//capture'
-        #     image_cnt += 1
-        #     cv2.imwrite(os.path.join(path , f'{image_cnt}.jpg'), image_np)
+        elif key == ord('T') and not thread_running:
+            thread.start()
+            thread_running = True
+
+        elif key == ord('C'): 
+            thread.join()
+            return 0
 
 
 
-        # Update camera pitch and yaw motors
-        camera_pitch_motor.setPosition(camera_pitch_position)
-        camera_yaw_motor.setPosition(camera_yaw_position)
+        global c_roll_disturbance ,c_pitch_disturbance ,c_camera_pitch_position, c_yaw_disturbance, c_target_altitude
 
-        roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + roll_acceleration + roll_disturbance
-        pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + pitch_acceleration + pitch_disturbance
-        yaw_input = yaw_disturbance
-        clamped_difference_altitude = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
-        vertical_input = k_vertical_p * math.pow(clamped_difference_altitude, 3.0)
+        camera_pitch_motor.setPosition(clamp(camera_pitch_position + c_camera_pitch_position,0,1.5))
+
+        roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + roll_acceleration + roll_disturbance + c_roll_disturbance
+        pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + pitch_acceleration + pitch_disturbance + c_pitch_disturbance
+        yaw_input = yaw_disturbance + c_yaw_disturbance
+        vertical_input = k_vertical_p * math.pow(target_altitude + c_target_altitude, 3.0)
+
 
         front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
         front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
@@ -167,231 +223,10 @@ def main():
         rear_right_motor.setVelocity(rear_right_motor_input)
 
 
-        if image_cnt < 100:
-            image_cnt += 1
-        else:
-            image = camera.getImageArray()
-            if image:
-                image_cnt = 0
-                image_np = np.array(image, dtype=np.uint8)
-
-
-                _, img_encoded = cv2.imencode('.jpg', image_np)
-                img_bytes = img_encoded.tobytes()
-
-                # Call the external script with the image data
-                proc = subprocess.Popen(['E:\\UNI\\8\\project\\mavic\\Scripts\\python.exe', 'test4.py'], stdin=subprocess.PIPE)
-                proc.communicate(input=img_bytes)
-
-
-
-
+        
 
 
 
 if __name__ == "__main__":
     main()
-
-# import torch
-# import time
-# import cv2
-# import numpy as np
-# from controller import Robot, Motor, Camera, Compass, GPS, Gyro, InertialUnit, Keyboard, LED
-# import math
-
-# import os
-
-# def sign(x):
-#     return (x > 0) - (x < 0)
-
-# def clamp(value, low, high):
-#     return max(min(value, high), low)
-
-# def main():
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-#     # Load the YOLOv5 model to the specified device
-#     model = torch.hub.load('ultralytics/yolov5', 'custom', path='best.pt')
-#     model.to(device)  # Move the model to the GPU if available
-#     model.eval()
-
-#     print("Model load successfully")
-
-#     image_cnt = 0
-
-#     robot = Robot()
-#     timestep = int(robot.getBasicTimeStep())
-
-#     # Get and enable devices.
-#     camera = robot.getDevice("camera")
-#     camera.enable(timestep)
-#     front_left_led = robot.getDevice("front left led")
-#     front_right_led = robot.getDevice("front right led")
-#     imu = robot.getDevice("inertial unit")
-#     imu.enable(timestep)
-#     gps = robot.getDevice("gps")
-#     gps.enable(timestep)
-#     compass = robot.getDevice("compass")
-#     compass.enable(timestep)
-#     gyro = robot.getDevice("gyro")
-#     gyro.enable(timestep)
-#     keyboard = Keyboard()
-#     keyboard.enable(timestep)
-#     camera_roll_motor = robot.getDevice("camera roll")
-#     camera_pitch_motor = robot.getDevice("camera pitch")
-#     camera_yaw_motor = robot.getDevice("camera yaw")  # Added for yaw control
-
-#     front_left_motor = robot.getDevice("front left propeller")
-#     front_right_motor = robot.getDevice("front right propeller")
-#     rear_left_motor = robot.getDevice("rear left propeller")
-#     rear_right_motor = robot.getDevice("rear right propeller")
-#     motors = [front_left_motor, front_right_motor, rear_left_motor, rear_right_motor]
-#     for motor in motors:
-#         motor.setPosition(float('inf'))
-#         motor.setVelocity(1.0)
-
-#     print("Start the drone...")
-
-#     while robot.step(timestep) != -1:
-#         if robot.getTime() > 1.0:
-#             break
-
-#     print("You can control the drone with your computer keyboard:")
-#     print("- 'up': move forward.")
-#     print("- 'down': move backward.")
-#     print("- 'right': turn right.")
-#     print("- 'left': turn left.")
-#     print("- 'shift + up': increase the target altitude.")
-#     print("- 'shift + down': decrease the target altitude.")
-#     print("- 'shift + right': strafe right.")
-#     print("- 'shift + left': strafe left.")
-#     print("- 'W': tilt camera up.")
-#     print("- 'S': tilt camera down.")
-#     print("- 'A': pan camera left.")
-#     print("- 'D': pan camera right.")
-
-#     k_vertical_thrust = 68.5
-#     k_vertical_offset = 0.6
-#     k_vertical_p = 3.0
-#     k_roll_p = 50.0
-#     k_pitch_p = 30.0
-
-#     target_altitude = 1.0
-
-#     # Variables for camera control
-#     camera_pitch_position = 0.0
-#     camera_yaw_position = 0.0
-#     camera_rotation_speed = 0.05  # Adjust this value to change camera rotation speed
-
-#     # Main control loop
-#     while robot.step(timestep) != -1:
-#         time = robot.getTime()
-#         roll = imu.getRollPitchYaw()[0]
-#         pitch = imu.getRollPitchYaw()[1]
-#         altitude = gps.getValues()[2]
-#         roll_acceleration = gyro.getValues()[0]
-#         pitch_acceleration = gyro.getValues()[1]
-
-#         led_state = int(time) % 2
-#         front_left_led.set(led_state)
-#         front_right_led.set(1 - led_state)
-
-#         camera_roll_motor.setPosition(-0.115 * roll_acceleration)
-#         camera_pitch_motor.setPosition(-0.1 * pitch_acceleration)
-
-#         roll_disturbance = 0.0
-#         pitch_disturbance = 0.0
-#         yaw_disturbance = 0.0
-#         key = keyboard.getKey()
-        
-#         if key == Keyboard.UP:
-#             pitch_disturbance = -2.0
-#         elif key == Keyboard.DOWN:
-#             pitch_disturbance = 2.0
-#         elif key == Keyboard.RIGHT:
-#             yaw_disturbance = -1.3
-#         elif key == Keyboard.LEFT:
-#             yaw_disturbance = 1.3
-#         elif key == (Keyboard.SHIFT + Keyboard.RIGHT):
-#             roll_disturbance = -1.0
-#         elif key == (Keyboard.SHIFT + Keyboard.LEFT):
-#             roll_disturbance = 1.0
-#         elif key == (Keyboard.SHIFT + Keyboard.UP):
-#             target_altitude += 0.05
-#             print(f"target altitude: {target_altitude:.2f} [m]")
-#         elif key == (Keyboard.SHIFT + Keyboard.DOWN):
-#             target_altitude -= 0.05
-#             print(f"target altitude: {target_altitude:.2f} [m]")
-#         elif key == ord('W'):  # Tilt camera up
-#             camera_pitch_position += camera_rotation_speed
-#         elif key == ord('S'):  # Tilt camera down
-#             camera_pitch_position -= camera_rotation_speed
-#         elif key == ord('A'):  # Pan camera left
-#             camera_yaw_position += camera_rotation_speed
-#         elif key == ord('D'):  # Pan camera right
-#             camera_yaw_position -= camera_rotation_speed
-
-
-#         # elif key == ord('C'):  # capture
-#         #     image = camera.getImageArray()
-#         #     image_np = np.array(image, dtype=np.uint8)
-#         #     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB) 
-#         #     image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
-#         #     path = 'E://UNI//8//project//images//capture'
-#         #     image_cnt += 1
-#         #     cv2.imwrite(os.path.join(path , f'{image_cnt}.jpg'), image_np)
-
-
-
-#         # Update camera pitch and yaw motors
-#         camera_pitch_motor.setPosition(camera_pitch_position)
-#         camera_yaw_motor.setPosition(camera_yaw_position)
-
-#         roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + roll_acceleration + roll_disturbance
-#         pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + pitch_acceleration + pitch_disturbance
-#         yaw_input = yaw_disturbance
-#         clamped_difference_altitude = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
-#         vertical_input = k_vertical_p * math.pow(clamped_difference_altitude, 3.0)
-
-#         front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
-#         front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
-#         rear_left_motor_input = k_vertical_thrust + vertical_input - roll_input - pitch_input + yaw_input
-#         rear_right_motor_input = k_vertical_thrust + vertical_input + roll_input - pitch_input - yaw_input
-        
-#         front_left_motor.setVelocity(front_left_motor_input)
-#         front_right_motor.setVelocity(-front_right_motor_input)
-#         rear_left_motor.setVelocity(-rear_left_motor_input)
-#         rear_right_motor.setVelocity(rear_right_motor_input)
-
-
-#         if image_cnt < 100:
-#             image_cnt += 1
-#         else:
-#             image = camera.getImageArray()
-#             if image:
-#                 image_cnt = 0
-#                 image_np = np.array(image, dtype=np.uint8)
-#                 image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB) 
-#                 image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
-
-#                 results = model(image_np)
-                
-#                 for result in results.pandas().xyxy[0].to_dict(orient='records'):
-#                         # Extract bounding boxes and draw on image
-#                         bbox = result['xmin'], result['ymin'], result['xmax'], result['ymax']
-#                         label = result['name']
-#                         confidence = result['confidence']
-                        
-#                         # Draw bounding box
-#                         cv2.rectangle(image_np, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 0), 2)
-#                         cv2.putText(image_np, f'{label} {confidence:.2f}', (int(bbox[0]), int(bbox[1] - 10)),
-#                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                    
-
-#                 cv2.imshow("Black and White Image", image_np)
-#                 cv2.waitKey(1)  # Wait for 1 ms to refresh the display
-
-
-
-# if __name__ == "__main__":
-#     main()
+    

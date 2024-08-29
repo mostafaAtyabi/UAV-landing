@@ -3,4 +3,5 @@
 base_mavic.wbt
 mavic
 documents
-yolov5
+yolov5/
+yolov5/** 
