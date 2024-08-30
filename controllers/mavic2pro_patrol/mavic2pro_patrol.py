@@ -21,12 +21,16 @@ model = torch.hub.load('ultralytics/yolov5', 'custom', path='best.pt')
 model.to(device)  
 model.eval()
 
+gps = robot.getDevice("gps")
+gps.enable(timestep)
+
 c_roll_disturbance = 0.0
 c_pitch_disturbance = 0.0
 c_camera_pitch_position = 0.0
 c_yaw_disturbance = 0
 c_target_altitude = 0
-
+camera_pitch_position = 0
+land = False
 
 def sign(x):
     return (x > 0) - (x < 0)
@@ -34,18 +38,112 @@ def sign(x):
 def clamp(value, low, high):
     return max(min(value, high), low)
 
+def create_mask(image):
+    image = cv2.cvtColor(image,cv2.COLOR_BGR2HLS)
+    lower = np.uint8([0, 200, 0])
+    upper = np.uint8([255, 255, 255])
+    white_mask = cv2.inRange(image, lower, upper)
+
+    lower = np.uint8([10, 0,   100])
+    upper = np.uint8([40, 255, 255])
+    yellow_mask = cv2.inRange(image, lower, upper)
+    mask = cv2.bitwise_or(white_mask, yellow_mask)
+
+    # cv2.imshow("mask", mask)
+    # cv2.waitKey(1)  
+    return mask
+
+def find_H(image):
+    _, binary = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+        else:
+            cX, cY = 0, 0
+
+        output_image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)  
+        cv2.circle(output_image, (cX, cY), 10, (0, 0, 255), -1)
+        cv2.putText(output_image, "Center", (cX - 20, cY - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        cv2.imshow("find_H", output_image)
+        cv2.waitKey(1) 
+        return(cX, cY) 
+
+def find_circle(gray):
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,  # Inverse ratio of the accumulator resolution to the image resolution
+        minDist=500,  # Minimum distance between detected centers
+        param1=70,  # Higher threshold for Canny edge detector
+        param2=50,  # Accumulator threshold for circle detection
+        minRadius=10,  # Minimum radius to be detected
+        maxRadius=0  # Maximum radius to be detected (0 means no max limit)
+    )
+    output_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+   
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        for (x, y, r) in circles:
+            cv2.circle(output_image, (x, y), r, (0, 255, 0), 4)
+            cv2.circle(output_image, (x, y), 10, (0, 0, 255), -1)
+            cv2.putText(output_image, "Center", (x - 20, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+      
+    cv2.imshow("find_circle", output_image)
+    cv2.waitKey(1)
+
+def second_step():
+    global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
+
+    while True:
+        sleep(0.1)
+        image = camera.getImageArray()
+        if image:
+            image_np = np.array(image, dtype=np.uint8)
+            img_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
+            img_rgb = cv2.resize(img_rgb, (length, width))
+            img_rgb = cv2.flip(img_rgb, 1)
+            
+            mask = create_mask(img_rgb)
+
+            center_x , center_y = find_H(mask)
+            
+            # find_circle(mask)
+
+            position = gps.getValues() 
+            height = position[2]
+            print(height)
+            
+            c_target_altitude = - 0.3
+            c_roll_disturbance = clamp(-(center_x - length/2) * 0.1, -1,1)
+            c_pitch_disturbance = clamp((center_y - width/2) * 0.02 , -1.5, 1.5)
+
+            if center_x < length * 0.35 or center_x > length * 0.65:
+                c_yaw_disturbance = clamp(-(center_x - length/2) * 0.001, -0.4, 0.4)
+
+            if height < 1.5:
+                c_roll_disturbance = 0
+                c_pitch_disturbance = 0  
+                land = True
+                return
 
 
 def image_processing():
+    global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
     first_step = True
+    c_camera_pitch_position = 0.8  + camera_pitch_position
+    
     while True:
-
-        # sleep(1)
-        # global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance
-        # c_camera_pitch_position += 0.5  
-        # print("camera_pitch_position change")
-   
-
         sleep(1)
         image = camera.getImageArray()
         if image:
@@ -77,32 +175,36 @@ def image_processing():
 
                 cv2.putText(img_rgb, f'{label} {confidence:.2f}', (int(bbox[0]), int(bbox[1] - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                
-
-                
-                global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude
-                
-
 
                 if first_step:
-                    c_yaw_disturbance = clamp(-(center_x - length/2) * 0.001, -0.1, 0.1)
+                    c_yaw_disturbance = clamp(-(center_x - length/2) * 0.01, -0.2, 0.2)
                     
-                    if center_y < 0.61 * width:  
-                        c_pitch_disturbance = -1
+                    if center_y < 0.65 * width:  
+                        c_pitch_disturbance = -2
                     else:   
-                        c_pitch_disturbance = 0.1
+                        c_pitch_disturbance = 2.1
 
-                    if center_y > 0.6 * width and c_camera_pitch_position - 0.1 < 1.7:  
-                        c_camera_pitch_position += 0.1  
+                    if center_y > 0.6 * width and c_camera_pitch_position + camera_pitch_position  < 1.36:  
+                        c_camera_pitch_position += 0.15  
                         print("camera_pitch_position change", c_camera_pitch_position) 
 
-                    if  c_pitch_disturbance == 0.1 and c_camera_pitch_position - 0.1 >= 1.7:
+                    if c_camera_pitch_position + camera_pitch_position >= 1.36:
                         first_step = False
 
                 else:
-                    c_target_altitude = - 0.7
-                    c_roll_disturbance = clamp(-(center_x - length/2) * 0.01, -1.0, 1.0)
-                    c_pitch_disturbance = clamp((center_y > width/2), -1, 2)
+                    position = gps.getValues() 
+                    height = position[2]
+                    print(height)
+                    if height <= 10:
+                        second_step()
+                        return
+                    else:
+                        c_target_altitude = - 1
+
+                    c_yaw_disturbance = clamp(-(center_x - length/2) * 0.01, -0.2, 0.2)
+                    c_pitch_disturbance = clamp((center_y - width/2) * 0.02, -1.5, 1.5)
+            else:
+                c_yaw_disturbance = -0.3
                     
             
             cv2.imshow("Black and White Image", img_rgb)
@@ -112,7 +214,7 @@ def image_processing():
 
 
 def main():  
-    global thread_running 
+    global thread_running ,camera_pitch_position
     imu = robot.getDevice("inertial unit")
     imu.enable(timestep)
 
@@ -125,6 +227,9 @@ def main():
     front_right_motor = robot.getDevice("front right propeller")
     rear_left_motor = robot.getDevice("rear left propeller")
     rear_right_motor = robot.getDevice("rear right propeller")
+
+
+    
     motors = [front_left_motor, front_right_motor, rear_left_motor, rear_right_motor]
     for motor in motors:
         motor.setPosition(float('inf'))
@@ -150,12 +255,12 @@ def main():
 
     camera_pitch_position = 0.0
     camera_rotation_speed = 0.05  
-
-    image_processing
+    
     thread = threading.Thread(target = image_processing)
     
     # Main control loop
     while robot.step(timestep) != -1:
+
         roll = imu.getRollPitchYaw()[0]
         pitch = imu.getRollPitchYaw()[1]
         
@@ -202,7 +307,7 @@ def main():
 
 
 
-        global c_roll_disturbance ,c_pitch_disturbance ,c_camera_pitch_position, c_yaw_disturbance, c_target_altitude
+        global c_roll_disturbance ,c_pitch_disturbance ,c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
 
         camera_pitch_motor.setPosition(clamp(camera_pitch_position + c_camera_pitch_position,0,1.5))
 
@@ -212,10 +317,16 @@ def main():
         vertical_input = k_vertical_p * math.pow(target_altitude + c_target_altitude, 3.0)
 
 
-        front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
-        front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
-        rear_left_motor_input = k_vertical_thrust + vertical_input - roll_input - pitch_input + yaw_input
-        rear_right_motor_input = k_vertical_thrust + vertical_input + roll_input - pitch_input - yaw_input
+        if land:
+            front_left_motor_input = 0
+            front_right_motor_input = 0
+            rear_left_motor_input = 0
+            rear_right_motor_input = 0
+        else:
+            front_left_motor_input = k_vertical_thrust + vertical_input - roll_input + pitch_input - yaw_input
+            front_right_motor_input = k_vertical_thrust + vertical_input + roll_input + pitch_input + yaw_input
+            rear_left_motor_input = k_vertical_thrust + vertical_input - roll_input - pitch_input + yaw_input
+            rear_right_motor_input = k_vertical_thrust + vertical_input + roll_input - pitch_input - yaw_input
         
         front_left_motor.setVelocity(front_left_motor_input)
         front_right_motor.setVelocity(-front_right_motor_input)
