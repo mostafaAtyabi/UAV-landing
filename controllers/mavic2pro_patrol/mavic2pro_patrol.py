@@ -105,7 +105,7 @@ def second_step():
     global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
 
     while True:
-        sleep(0.5)
+        sleep(1)
         image = camera.getImageArray()
         if image:
             image_np = np.array(image, dtype=np.uint8)
@@ -124,11 +124,11 @@ def second_step():
             print(height)
             
             c_target_altitude = - 0.3
-            c_roll_disturbance = clamp(-(center_x - length/2) * 0.1, -1,1)
-            c_pitch_disturbance = clamp((center_y - width/2) * 0.02 , -1.5, 1.5)
+            c_roll_disturbance = clamp(-(center_x - length/2) * 0.05, -0.8,0.8)
+            c_pitch_disturbance = clamp((center_y - width/2) * 0.02 , -1.4, 1.4)
 
             if center_x < length * 0.35 or center_x > length * 0.65:
-                c_yaw_disturbance = clamp(-(center_x - length/2) * 0.001, -0.4, 0.4)
+                c_yaw_disturbance = clamp(-(center_x - length/2) * 0.001, -0.3, 0.3)
 
             if height < 1.5:
                 c_roll_disturbance = 0
