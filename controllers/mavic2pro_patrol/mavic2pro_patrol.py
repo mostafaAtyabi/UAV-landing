@@ -105,7 +105,7 @@ def second_step():
     global c_roll_disturbance, c_pitch_disturbance, c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
 
     while True:
-        sleep(0.1)
+        sleep(0.5)
         image = camera.getImageArray()
         if image:
             image_np = np.array(image, dtype=np.uint8)
@@ -117,7 +117,6 @@ def second_step():
             mask = create_mask(img_rgb)
 
             center_x , center_y = find_H(mask)
-            
             # find_circle(mask)
 
             position = gps.getValues() 
@@ -152,12 +151,10 @@ def image_processing():
             img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
             img_rgb = cv2.resize(img_rgb, (length, width))
             img_rgb = cv2.flip(img_rgb, 1) 
-            results = model(img_rgb)
-            
+            results = model(img_rgb)            
    
             highest_confidence_result = None
             max_confidence = 0
-
             for result in results.pandas().xyxy[0].to_dict(orient='records'):
                 confidence = result['confidence']
                 if confidence > max_confidence:
@@ -190,7 +187,6 @@ def image_processing():
 
                     if c_camera_pitch_position + camera_pitch_position >= 1.36:
                         first_step = False
-
                 else:
                     position = gps.getValues() 
                     height = position[2]
@@ -227,15 +223,11 @@ def main():
     front_right_motor = robot.getDevice("front right propeller")
     rear_left_motor = robot.getDevice("rear left propeller")
     rear_right_motor = robot.getDevice("rear right propeller")
-
-
     
     motors = [front_left_motor, front_right_motor, rear_left_motor, rear_right_motor]
     for motor in motors:
         motor.setPosition(float('inf'))
         motor.setVelocity(1.0)
-
-    print("Start the drone...")
 
     keyboard = Keyboard()
     keyboard.enable(timestep)
@@ -244,29 +236,21 @@ def main():
         if robot.getTime() > 1.0:
             break
 
-
-
     k_vertical_thrust = 68.5
     k_vertical_p = 3.0
     k_roll_p = 50.0
     k_pitch_p = 30.0
-
     target_altitude = 1.0
+    camera_pitch_position = 0.0 
 
-    camera_pitch_position = 0.0
-    camera_rotation_speed = 0.05  
-    
     thread = threading.Thread(target = image_processing)
     
     # Main control loop
     while robot.step(timestep) != -1:
-
         roll = imu.getRollPitchYaw()[0]
         pitch = imu.getRollPitchYaw()[1]
-        
         roll_acceleration = gyro.getValues()[0]
         pitch_acceleration = gyro.getValues()[1]
-
         camera_pitch_motor.setPosition(-0.1 * pitch_acceleration)
 
         roll_disturbance = 0.0
@@ -274,7 +258,6 @@ def main():
         yaw_disturbance = 0.0
         target_altitude = 0.59
         key = keyboard.getKey()
-        
         if key == Keyboard.UP:
             pitch_disturbance = -2.0
         elif key == Keyboard.DOWN:
@@ -291,31 +274,19 @@ def main():
             target_altitude += 0.5
         elif key == (Keyboard.SHIFT + Keyboard.DOWN):
             target_altitude -= 0.5
-        elif key == ord('W'):  # Tilt camera up
-            camera_pitch_position += camera_rotation_speed
-        elif key == ord('S'):  # Tilt camera down
-            camera_pitch_position -= camera_rotation_speed
-
-
         elif key == ord('T') and not thread_running:
             thread.start()
             thread_running = True
-
         elif key == ord('C'): 
             thread.join()
             return 0
 
-
-
         global c_roll_disturbance ,c_pitch_disturbance ,c_camera_pitch_position, c_yaw_disturbance, c_target_altitude, land
-
         camera_pitch_motor.setPosition(clamp(camera_pitch_position + c_camera_pitch_position,0,1.5))
-
         roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + roll_acceleration + roll_disturbance + c_roll_disturbance
         pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + pitch_acceleration + pitch_disturbance + c_pitch_disturbance
         yaw_input = yaw_disturbance + c_yaw_disturbance
         vertical_input = k_vertical_p * math.pow(target_altitude + c_target_altitude, 3.0)
-
 
         if land:
             front_left_motor_input = 0
